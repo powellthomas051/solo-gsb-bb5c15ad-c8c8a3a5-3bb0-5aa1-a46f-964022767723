@@ -15,7 +15,10 @@
 - `POST /business-occurrences` 额外支持把每个原始实例按 `following` /
   `preceding` / `modified_following` 约定调整到营业日（自定义节假日与周末、
   保持时分秒），同一 UTC 时刻合并并通过 `originals` 回溯原始实例
-- 无效时区、无效规则、无效区间返回**结构化 JSON 错误**
+- `POST /available-occurrences` 在 `/occurrences` 的展开结果上叠加时长与
+  忙碌区间：先校验并合并重叠/相邻的忙碌区间，再按**真实经过分钟**计算结束
+  时刻，只返回与忙碌区间无交集的候选时段（本地与 UTC 起止、fold、来源齐全）
+- 无效时区、无效规则、无效区间、无效忙碌区间返回**结构化 JSON 错误**
 
 ## 一键启动
 
@@ -30,6 +33,15 @@ docker compose up --build -d
 - 健康检查：http://localhost:8000/health
 - 交互式 API 文档（Swagger UI）：http://localhost:8000/docs
 - 停止服务：`docker compose down`
+
+一条命令启动并验证（构建、起服务、调用新端点）：
+
+```bash
+docker compose up --build -d && sleep 3 && curl -s -X POST http://localhost:8000/available-occurrences -H 'Content-Type: application/json' -d '{"timezone":"UTC","start_local":"2025-01-01T09:00:00","rrule":"FREQ=DAILY;COUNT=2","duration_minutes":60,"busy_intervals":[{"start":"2025-01-01T09:30:00Z","end":"2025-01-01T10:30:00Z"}],"interval_start":"2025-01-01T00:00:00Z","interval_end":"2025-01-03T00:00:00Z"}'
+```
+
+端口映射在 `docker-compose.yml` 中固定为宿主机 **8000** → 容器 **8000**
+（如被占用可把左侧改为 `8001:8000`）。
 
 > 不想用容器时也可以本地运行：
 > `pip install -r requirements.txt` 然后
@@ -113,6 +125,47 @@ docker compose up --build -d
   “节假日数 + 7 天”的余量，因此调整后恰好进入区间的实例不会丢失
 - 响应在 `/occurrences` 基础上新增顶层 `business_day_convention`，每个实例新增
   `originals: string[]`（未发生合并时仅含调整前的原始墙钟时间自身）
+
+### `POST /available-occurrences`
+
+在 `/occurrences` 的**全部字段与语义**之上，复用同一套 RRULE、IANA 时区与
+`dst_policy`（gap / fold）策略展开候选**开始**时刻，并新增两个字段：
+
+| 字段 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `duration_minutes` | 是 | — | 候选时段时长（**真实经过分钟**，可为小数，必须 > 0）；结束时刻在 UTC 时间轴上相加，跨越 DST 转换也不会改变时长 |
+| `busy_intervals` | 否 | `[]` | 忙碌区间列表，每项为带偏移的半开 UTC 区间 `{"start": ..., "end": ...}`，端点必须带 `Z` 或 `+HH:MM` 偏移，且 `start < end` |
+
+处理流程与语义：
+
+1. 先**校验**每条忙碌区间（偏移必填、起点严格早于终点），把任意偏移换算成 UTC，
+   再**合并所有重叠或相邻**（`end == start`）的区间；合并结果按起点排序并在
+   响应的顶层 `busy_intervals` 中原样回显（归一化为 UTC、末尾 `Z`）
+2. 候选开始时刻与 `/occurrences` 完全一致（含 gap 跳过/顺延、fold 两条、
+   EXDATE、RRULE 优先于 RDATE 等全部规则）
+3. 每个候选的结束时刻 = 开始 UTC 时刻 + `duration_minutes`（真实经过时间，
+   不是墙钟加减），再从真实结束时刻反读本地墙钟时间与偏移；因此跨秋季回拨时
+   结束墙钟可能“看起来只过了一部分分钟”、跨春季跳时则会多出缺口分钟数
+4. 仅当半开区间 `[start, end)` 与任何合并后忙碌区间**无交集**时返回该候选
+   （端点相接，如候选 `end == 忙碌 start`，**不算**冲突）
+5. **查询窗口只约束开始时刻**：开始时刻在 `[interval_start, interval_end)` 内
+   即参与判定，结束时刻可以落在窗口之外
+6. **重复墙钟时间分别判定**：fold 的两个 pass 是两个独立候选，可能其中一个与
+   忙碌区间冲突被剔除、另一个保留（也受 `dst_policy.fold` 的
+   `both`/`earlier`/`later` 控制）
+
+每个返回时段的字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `local_start` / `local_end` | 目标时区本地起止墙钟时间（ISO-8601，不含偏移；结束为真实结束时刻反读） |
+| `utc_start` / `utc_end` | UTC 起止时刻（末尾 `Z`），两者相差恰好 `duration_minutes` |
+| `utc_offset_start` / `utc_offset_end` | 起止时刻各自的 UTC 偏移（跨 DST 时可能不同） |
+| `dst_start` / `dst_end` | 起止时刻各自是否处于夏令时 |
+| `fold` / `fold_end` | 起止时刻各自的 fold（`0`/`1`；如 60 分钟时段从回拨第一次 `01:30`（fold=0，-04:00）开始，结束于第二次 `01:30`（fold_end=1，-05:00）） |
+| `source` | `rrule` 或 `rdate`（沿用展开来源） |
+
+响应顶层额外包含 `duration_minutes` 与合并后的 `busy_intervals`。
 
 ## 使用示例
 
@@ -368,6 +421,90 @@ curl -s -X POST http://localhost:8000/business-occurrences \
 仍记录原始的 `2025-03-08T02:30:00`。排除该原始墙钟时间即可移除该实例，
 排除调整后的 `2025-03-09T03:30:00` 则不起作用。
 
+### 可用时段：忙碌区间合并 + 真实经过时长
+
+UTC 每日 09:00、时长 90 分钟的候选；两条忙碌区间分别用 `Z` 与 `+08:00`
+偏移给出，其中两条重叠的会先合并（1 月 2 日的候选因此被剔除；忙碌区间
+恰好从候选结束时刻开始时不算冲突）：
+
+```bash
+curl -s -X POST http://localhost:8000/available-occurrences \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "Asia/Shanghai",
+    "start_local": "2025-01-01T09:00:00",
+    "rrule": "FREQ=DAILY;COUNT=3",
+    "duration_minutes": 90,
+    "busy_intervals": [
+      {"start": "2025-01-02T09:30:00+08:00", "end": "2025-01-02T11:00:00+08:00"},
+      {"start": "2025-01-02T10:00:00Z", "end": "2025-01-02T12:00:00Z"}
+    ],
+    "interval_start": "2024-12-31T16:00:00Z",
+    "interval_end": "2025-01-05T16:00:00Z"
+  }'
+```
+
+```json
+{
+  "timezone": "Asia/Shanghai",
+  "duration_minutes": 90,
+  "count": 2,
+  "busy_intervals": [
+    {"start": "2025-01-02T01:30:00Z", "end": "2025-01-02T03:00:00Z"},
+    {"start": "2025-01-02T10:00:00Z", "end": "2025-01-02T12:00:00Z"}
+  ],
+  "occurrences": [
+    {"local_start": "2025-01-01T09:00:00", "local_end": "2025-01-01T10:30:00",
+     "utc_start": "2025-01-01T01:00:00Z", "utc_end": "2025-01-01T02:30:00Z",
+     "utc_offset_start": "+08:00", "utc_offset_end": "+08:00",
+     "dst_start": false, "dst_end": false, "fold": 0, "fold_end": 0, "source": "rrule"},
+    {"local_start": "2025-01-03T09:00:00", "local_end": "2025-01-03T10:30:00",
+     "utc_start": "2025-01-03T01:00:00Z", "utc_end": "2025-01-03T02:30:00Z",
+     "utc_offset_start": "+08:00", "utc_offset_end": "+08:00",
+     "dst_start": false, "dst_end": false, "fold": 0, "fold_end": 0, "source": "rrule"}
+  ]
+}
+```
+
+### 可用时段：跨秋季回拨，fold 分别判定
+
+纽约 `2025-11-02 01:30` 重复出现。60 分钟时段从第一次（EDT `05:30Z`，
+`fold=0`）开始，真实经过 60 分钟后结束于 `06:30Z`，本地仍是 `01:30`，
+但偏移已是 EST（`fold_end=1`）。若忙碌区间只覆盖第一次 pass，则第二次
+pass 的候选仍可返回——**重复墙钟时间分别判定**：
+
+```bash
+curl -s -X POST http://localhost:8000/available-occurrences \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "America/New_York",
+    "start_local": "2025-11-02T01:30:00",
+    "duration_minutes": 30,
+    "busy_intervals": [
+      {"start": "2025-11-02T05:30:00Z", "end": "2025-11-02T06:00:00Z"}
+    ],
+    "interval_start": "2025-11-02T00:00:00Z",
+    "interval_end": "2025-11-03T00:00:00Z"
+  }'
+```
+
+```json
+{
+  "timezone": "America/New_York",
+  "duration_minutes": 30,
+  "count": 1,
+  "busy_intervals": [
+    {"start": "2025-11-02T05:30:00Z", "end": "2025-11-02T06:00:00Z"}
+  ],
+  "occurrences": [
+    {"local_start": "2025-11-02T01:30:00", "local_end": "2025-11-02T02:00:00",
+     "utc_start": "2025-11-02T06:30:00Z", "utc_end": "2025-11-02T07:00:00Z",
+     "utc_offset_start": "-05:00", "utc_offset_end": "-05:00",
+     "dst_start": false, "dst_end": false, "fold": 1, "fold_end": 0, "source": "rrule"}
+  ]
+}
+```
+
 ## 错误响应
 
 所有错误均为统一结构：`{"error": {"code": ..., "message": ..., "details": [...]}}`。
@@ -377,9 +514,10 @@ curl -s -X POST http://localhost:8000/business-occurrences \
 | 400 | `invalid_timezone` | 非合法 IANA 时区（如 `Not/AZone`） |
 | 400 | `invalid_rrule` | 规则无法解析：缺 `FREQ`、非法频率、`INTERVAL=0`、`COUNT<=0`、非法日期值、`UNTIL` 格式错误等 |
 | 400 | `invalid_interval` | `interval_start >= interval_end` |
-| 400 | `invalid_datetime` | 时间字段语法错误，或查询区间缺少 UTC 偏移 |
+| 400 | `invalid_datetime` | 时间字段语法错误，或查询区间、`busy_intervals` 端点缺少 UTC 偏移 |
 | 400 | `too_many_occurrences` | 展开实例数/扫描量超过 `APP_MAX_OCCURRENCES` |
-| 422 | `validation_error` | 请求体不是合法 JSON、缺少必填字段或字段值非法（如 `dst_policy` 的 `gap`/`fold` 取值不在允许列表内、`weekend_days` 含非法星期或把整周都设为周末、`business_day_convention` 取值非法）（含字段级 details） |
+| 400 | `invalid_busy_interval` | `busy_intervals` 条目起点不早于终点（含空区间/反转）（details 指向具体下标，如 `busy_intervals[0]`） |
+| 422 | `validation_error` | 请求体不是合法 JSON、缺少必填字段或字段值非法（如 `dst_policy` 的 `gap`/`fold` 取值不在允许列表内、`weekend_days` 含非法星期或把整周都设为周末、`business_day_convention` 取值非法、`duration_minutes` 缺失或 ≤ 0、`busy_intervals` 条目缺少 `start`/`end`）（含字段级 details） |
 
 ## 项目结构
 
@@ -392,8 +530,9 @@ curl -s -X POST http://localhost:8000/business-occurrences \
 │   ├── engine.py     # RRULE 解析、时区/DST gap/fold 展开核心
 │   └── errors.py     # 结构化错误类型
 ├── tests/
-│   ├── test_api.py           # pytest + TestClient 端到端测试
-│   └── test_business_api.py  # POST /business-occurrences 端到端测试
+│   ├── test_api.py             # pytest + TestClient 端到端测试
+│   ├── test_business_api.py    # POST /business-occurrences 端到端测试
+│   └── test_available_api.py   # POST /available-occurrences 端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

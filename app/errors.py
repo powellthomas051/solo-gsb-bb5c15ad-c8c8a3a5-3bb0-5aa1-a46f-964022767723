@@ -73,3 +73,20 @@ def invalid_business_calendar(message: str) -> APIError:
         message=f"Invalid business calendar: {message}",
         status_code=422,
     )
+
+
+def invalid_busy_interval(message: str) -> APIError:
+    """A malformed ``busy_intervals`` entry (missing offset, empty range, ...)."""
+    return APIError(
+        code="invalid_busy_interval",
+        message=f"Invalid busy interval: {message}",
+    )
+
+
+def invalid_duration(message: str) -> APIError:
+    """Bad ``duration_minutes`` value; rendered as the unified 422 error."""
+    return APIError(
+        code="validation_error",
+        message=f"Invalid duration_minutes: {message}",
+        status_code=422,
+    )

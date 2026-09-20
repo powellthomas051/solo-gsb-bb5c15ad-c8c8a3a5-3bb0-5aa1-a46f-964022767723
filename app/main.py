@@ -12,11 +12,14 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .engine import (
     DEFAULT_MAX_OCCURRENCES,
+    expand_available_occurrences,
     expand_business_occurrences,
     expand_occurrences,
 )
 from .errors import APIError
 from .schemas import (
+    AvailableOccurrenceRequest,
+    AvailableOccurrenceResponse,
     BusinessOccurrenceRequest,
     BusinessOccurrenceResponse,
     HealthResponse,
@@ -121,3 +124,33 @@ async def business_occurrences(request: BusinessOccurrenceRequest) -> BusinessOc
         request.model_dump(), max_occurrences=_max_occurrences()
     )
     return BusinessOccurrenceResponse(**result)
+
+
+@app.post(
+    "/available-occurrences",
+    response_model=AvailableOccurrenceResponse,
+    tags=["occurrences"],
+    summary="Find recurrence-based candidate slots that do not clash with busy intervals",
+    description=(
+        "Expands the recurrence set exactly like `/occurrences` (same RRULE, "
+        "time-zone, EXDATE and `dst_policy` gap/fold semantics); every kept "
+        "start instant inside the query window becomes a candidate lasting "
+        "`duration_minutes` of *real elapsed* time (the end is computed on the "
+        "UTC timeline, so crossing a DST transition never changes the length). "
+        "`busy_intervals` are half-open `[start, end)` UTC blocks with explicit "
+        "offsets; overlapping or adjacent blocks are validated and merged "
+        "first, then every candidate whose `[start, end)` intersects a busy "
+        "block is dropped. The query window constrains the *start only* (a slot "
+        "may end after `interval_end`), and the two passes of a repeated wall "
+        "time are judged independently, so one fold can be busy while the other "
+        "is free. Each kept slot reports local and UTC start/end times, both "
+        "offsets, both fold values and the source."
+    ),
+)
+async def available_occurrences(
+    request: AvailableOccurrenceRequest,
+) -> AvailableOccurrenceResponse:
+    result = expand_available_occurrences(
+        request.model_dump(), max_occurrences=_max_occurrences()
+    )
+    return AvailableOccurrenceResponse(**result)

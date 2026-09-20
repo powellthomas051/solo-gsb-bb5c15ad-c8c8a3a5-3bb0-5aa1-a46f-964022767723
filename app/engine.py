@@ -25,10 +25,19 @@ convention while preserving its hour/minute/second. Several raw instances can
 land on the same adjusted wall time (or UTC instant after DST resolution);
 they are merged into one occurrence whose ``originals`` lists the contributing
 raw wall times. EXDATE still matches the wall time *before* the adjustment.
+
+``expand_available_occurrences`` reuses the plain recurrence expansion: each
+kept occurrence is treated as the *start* of a candidate whose end is computed
+by adding ``duration_minutes`` of real elapsed time on the UTC timeline (so a
+DST transition never changes the slot length). The query window constrains
+the *start only*; each pass of a repeated wall time (fold) is judged
+separately against the supplied busy intervals, which are validated and
+merged (overlapping or touching blocks become one) before filtering.
 """
 
 from __future__ import annotations
 
+import bisect
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -39,7 +48,9 @@ from dateutil.rrule import rrulestr
 from .errors import (
     APIError,
     invalid_business_calendar,
+    invalid_busy_interval,
     invalid_datetime,
+    invalid_duration,
     invalid_dst_policy,
     invalid_interval,
     invalid_rrule,
@@ -400,8 +411,19 @@ def _scan_rule_walls(
     return rule_walls
 
 
-def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES) -> dict:
-    """Expand a recurrence request into occurrences inside the query interval."""
+def _collect_occurrences(
+    payload: dict,
+    max_occurrences: int = DEFAULT_MAX_OCCURRENCES,
+) -> tuple[str, ZoneInfo, datetime, datetime, dict]:
+    """Shared expansion core for ``/occurrences`` and ``/available-occurrences``.
+
+    Parses the common request fields, enumerates DTSTART/RRULE/RDATE wall times
+    (with EXDATE removal and the ``dst_policy`` gap/fold resolution), and
+    returns ``(timezone_name, zone, lo_utc, hi_utc, chosen)`` where ``chosen``
+    maps each surviving UTC instant to
+    ``(local_wall, aware_datetime, fold, source)``. The query window is a
+    half-open ``[lo_utc, hi_utc)`` and constrains the *UTC start instant only*.
+    """
     tz_name = payload["timezone"]
     zone = get_zone(tz_name)
 
@@ -473,6 +495,13 @@ def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRE
         )
     for wall in rdates:
         add(wall, "rdate")
+
+    return tz_name, zone, lo_utc, hi_utc, chosen
+
+
+def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES) -> dict:
+    """Expand a recurrence request into occurrences inside the query interval."""
+    tz_name, _zone, _lo_utc, _hi_utc, chosen = _collect_occurrences(payload, max_occurrences)
 
     ordered = sorted(chosen.items(), key=lambda item: (item[0], item[1][2]))
     occurrences = [
@@ -695,4 +724,152 @@ def expand_business_occurrences(
         "count": len(occurrences),
         "business_day_convention": convention,
         "occurrences": occurrences,
+    }
+
+
+# ------------------------------------------------------------- availability --
+
+
+def _parse_duration_minutes(raw: Any) -> timedelta:
+    """Validate ``duration_minutes`` and build the elapsed-time delta."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise invalid_duration("must be a positive number of minutes")
+    try:
+        duration = timedelta(minutes=float(raw))
+    except (OverflowError, ValueError):
+        raise invalid_duration("value is out of range") from None
+    if duration <= timedelta(0):
+        raise invalid_duration("must be strictly greater than zero")
+    return duration
+
+
+def parse_and_merge_busy_intervals(raw: Any) -> list[tuple[datetime, datetime]]:
+    """Validate the busy blocks and merge overlapping or adjacent ones.
+
+    Each block is a half-open ``[start, end)`` UTC interval; the request may
+    give either bound in any offset zone. Blocks that overlap or merely touch
+    (``end == start``) are merged into one, and the result is sorted and
+    normalized to UTC.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise invalid_busy_interval("expected a list of {start, end} objects")
+
+    intervals: list[tuple[datetime, datetime]] = []
+    for index, item in enumerate(raw):
+        where = f"busy_intervals[{index}]"
+        if not isinstance(item, dict):
+            raise invalid_busy_interval(f"{where} must be an object with 'start' and 'end'")
+        start_value = item.get("start")
+        end_value = item.get("end")
+        if not isinstance(start_value, str) or not isinstance(end_value, str):
+            raise invalid_busy_interval(f"{where}.start and {where}.end must be datetime strings")
+        start = parse_aware_bound(start_value, f"{where}.start")
+        end = parse_aware_bound(end_value, f"{where}.end")
+        if start >= end:
+            raise invalid_busy_interval(f"{where} start must be strictly before end")
+        intervals.append((start, end))
+
+    intervals.sort()
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            # Overlap or adjacency (start == previous end) -> extend the block.
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _is_blocked(
+    slot_start: datetime,
+    slot_end: datetime,
+    busy_starts: list[datetime],
+    busy: list[tuple[datetime, datetime]],
+) -> bool:
+    """Half-open intersection between ``[slot_start, slot_end)`` and a busy block."""
+    idx = bisect.bisect_right(busy_starts, slot_start) - 1
+    if idx >= 0 and busy[idx][1] > slot_start:
+        return True
+    idx += 1
+    if idx < len(busy) and busy[idx][0] < slot_end:
+        return True
+    return False
+
+
+def _format_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def _make_available_output(
+    start_aware: datetime,
+    end_utc: datetime,
+    local_wall: datetime,
+    source: str,
+    zone: tzinfo,
+) -> dict:
+    end_local = end_utc.astimezone(zone)
+    start_local = start_aware.astimezone(zone)
+    start_offset = start_aware.utcoffset() or timedelta(0)
+    end_offset = end_local.utcoffset() or timedelta(0)
+    start_dst = start_aware.dst()
+    end_dst = end_local.dst()
+    return {
+        "local_start": local_wall.isoformat(),
+        "local_end": end_local.replace(tzinfo=None).isoformat(),
+        "utc_start": _format_utc(start_aware),
+        "utc_end": _format_utc(end_utc),
+        "utc_offset_start": _format_offset(start_offset),
+        "utc_offset_end": _format_offset(end_offset),
+        "dst_start": bool(start_dst and start_dst.total_seconds() != 0),
+        "dst_end": bool(end_dst and end_dst.total_seconds() != 0),
+        "fold": start_local.fold,
+        "fold_end": end_local.fold,
+        "source": source,
+    }
+
+
+def expand_available_occurrences(
+    payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES
+) -> dict:
+    """Expand candidate starts and keep those free of busy intervals.
+
+    The recurrence set (DTSTART/RRULE/RDATE, EXDATE, time zone and DST policy)
+    is expanded exactly like ``/occurrences``. Every surviving *start* instant
+    whose UTC instant lies in the query window becomes a candidate; its end is
+    ``duration_minutes`` of real elapsed time later, regardless of any DST
+    transition crossed along the way. A candidate is returned only when its
+    half-open ``[start, end)`` interval has no intersection with any
+    (validated, merged) busy block. Repeated wall times are decided per fold,
+    so one pass may be busy while the other is free.
+    """
+    duration = _parse_duration_minutes(payload.get("duration_minutes"))
+    busy = parse_and_merge_busy_intervals(payload.get("busy_intervals"))
+    busy_starts = [start for start, _end in busy]
+
+    tz_name, zone, _lo_utc, _hi_utc, chosen = _collect_occurrences(payload, max_occurrences)
+
+    ordered = sorted(chosen.items(), key=lambda item: (item[0], item[1][2]))
+    slots: list[dict] = []
+    for instant, (local_wall, start_aware, _fold, source) in ordered:
+        try:
+            end_utc = instant + duration
+        except OverflowError:
+            raise invalid_duration("slot end is out of range") from None
+        if _is_blocked(instant, end_utc, busy_starts, busy):
+            continue
+        slots.append(
+            _make_available_output(start_aware, end_utc, local_wall, source, zone)
+        )
+
+    return {
+        "timezone": tz_name,
+        "duration_minutes": float(payload["duration_minutes"]),
+        "count": len(slots),
+        "busy_intervals": [
+            {"start": _format_utc(start), "end": _format_utc(end)} for start, end in busy
+        ],
+        "occurrences": slots,
     }

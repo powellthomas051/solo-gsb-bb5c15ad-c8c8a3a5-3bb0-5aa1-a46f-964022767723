@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, confloat
 
 
 class DstPolicy(BaseModel):
@@ -126,6 +126,59 @@ class BusinessOccurrenceRequest(OccurrenceRequest):
     )
 
 
+class BusyInterval(BaseModel):
+    """A half-open busy block ``[start, end)`` given as UTC instants."""
+
+    start: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Inclusive busy-block start. Must carry an offset (e.g. 'Z' or "
+            "'+08:00'); it is converted to UTC before merging."
+        ),
+        examples=["2025-01-01T10:00:00Z"],
+    )
+    end: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Exclusive busy-block end. Must carry an offset (e.g. 'Z' or "
+            "'+08:00'); it is converted to UTC before merging."
+        ),
+        examples=["2025-01-01T11:30:00Z"],
+    )
+
+
+class AvailableOccurrenceRequest(OccurrenceRequest):
+    """Body of ``POST /available-occurrences``.
+
+    Adds a meeting length (``duration_minutes``) and a list of busy blocks
+    (``busy_intervals``) to :class:`OccurrenceRequest`. The recurrence set is
+    expanded exactly as for ``POST /occurrences`` (same RRULE, time-zone and
+    ``dst_policy`` semantics); each kept instance becomes a candidate slot
+    starting at that instant and lasting ``duration_minutes`` of *real elapsed*
+    time, and slots intersecting any (merged) busy block are removed.
+    """
+
+    duration_minutes: confloat(gt=0) = Field(
+        ...,
+        description=(
+            "Slot length in real elapsed minutes (fractions allowed; the "
+            "duration is added on the UTC timeline, so DST transitions never "
+            "change its length). Must be strictly positive."
+        ),
+        examples=[60],
+    )
+    busy_intervals: list[BusyInterval] = Field(
+        default_factory=list,
+        description=(
+            "Half-open busy intervals [start, end) with explicit UTC offsets. "
+            "Overlapping or adjacent (end == start) intervals are validated "
+            "and merged before candidate filtering. Defaults to [] (no blocks)."
+        ),
+    )
+
+
 class Occurrence(BaseModel):
     local: str = Field(..., description="Wall-clock time in the requested zone (ISO-8601).")
     utc: str = Field(..., description="UTC instant with trailing 'Z' (ISO-8601).")
@@ -167,6 +220,66 @@ class BusinessOccurrenceResponse(BaseModel):
     count: int
     business_day_convention: Literal["following", "preceding", "modified_following"]
     occurrences: list[BusinessOccurrence]
+
+
+class AvailableOccurrence(BaseModel):
+    local_start: str = Field(
+        ..., description="Slot start wall-clock time in the requested zone (ISO-8601)."
+    )
+    local_end: str = Field(
+        ...,
+        description=(
+            "Slot end wall clock in the requested zone, read back from the "
+            "real end instant (so it reflects any offset change along the slot)."
+        ),
+    )
+    utc_start: str = Field(..., description="Slot start UTC instant with trailing 'Z'.")
+    utc_end: str = Field(..., description="Slot end UTC instant with trailing 'Z'.")
+    utc_offset_start: str = Field(
+        ..., description="UTC offset at the slot start, formatted as '+HH:MM'/'-HH:MM'."
+    )
+    utc_offset_end: str = Field(
+        ..., description="UTC offset at the slot end, formatted as '+HH:MM'/'-HH:MM'."
+    )
+    dst_start: bool = Field(..., description="Whether DST is in effect at the slot start.")
+    dst_end: bool = Field(..., description="Whether DST is in effect at the slot end.")
+    fold: Literal[0, 1] = Field(
+        ...,
+        description=(
+            "fold of the slot start: 0 for a regular time / the first pass of a "
+            "repeated wall time, 1 for the second pass. The end has its own "
+            "'fold_end' because a long slot can cross a transition."
+        ),
+    )
+    fold_end: Literal[0, 1] = Field(
+        ...,
+        description=(
+            "fold of the slot end: 1 when the end wall time is the second pass "
+            "of a repeated wall time (fall-back), otherwise 0."
+        ),
+    )
+    source: Literal["rrule", "rdate"] = Field(
+        ..., description="Whether the instance comes from the RRULE or an RDATE entry."
+    )
+
+
+class MergedBusyInterval(BaseModel):
+    start: str = Field(..., description="Merged inclusive block start in UTC (trailing 'Z').")
+    end: str = Field(..., description="Merged exclusive block end in UTC (trailing 'Z').")
+
+
+class AvailableOccurrenceResponse(BaseModel):
+    timezone: str
+    duration_minutes: float
+    count: int
+    busy_intervals: list[MergedBusyInterval] = Field(
+        ...,
+        description=(
+            "The busy intervals after validating and merging overlapping or "
+            "adjacent blocks, normalized to UTC and sorted."
+        ),
+    )
+    occurrences: list[AvailableOccurrence]
 
 
 class HealthResponse(BaseModel):
