@@ -12,11 +12,14 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .engine import (
     DEFAULT_MAX_OCCURRENCES,
+    expand_available_occurrences,
     expand_business_occurrences,
     expand_occurrences,
 )
 from .errors import APIError
 from .schemas import (
+    AvailableOccurrenceRequest,
+    AvailableOccurrenceResponse,
     BusinessOccurrenceRequest,
     BusinessOccurrenceResponse,
     HealthResponse,
@@ -121,3 +124,31 @@ async def business_occurrences(request: BusinessOccurrenceRequest) -> BusinessOc
         request.model_dump(), max_occurrences=_max_occurrences()
     )
     return BusinessOccurrenceResponse(**result)
+
+
+@app.post(
+    "/available-occurrences",
+    response_model=AvailableOccurrenceResponse,
+    tags=["occurrences"],
+    summary="Expand candidate start times and keep slots free of busy intervals",
+    description=(
+        "Expands the recurrence set exactly like `/occurrences` (same RRULE/RDATE/EXDATE, "
+        "IANA time-zone and DST gap/fold policies), then builds a slot of "
+        "`duration_minutes` real elapsed minutes for every candidate whose **start** "
+        "falls inside the half-open query window `[interval_start, interval_end)`. "
+        "Busy half-open intervals with explicit offsets (`busy_intervals`) are validated "
+        "and merged (overlapping or touching) first; only slots `[start, end)` with no "
+        "intersection with the merged busy intervals are returned. Each pass of a "
+        "repeated wall time (fold) is judged independently. Every slot gives local and "
+        "UTC start/end instants plus the start's fold and source; the end may cross DST "
+        "transitions and is resolved independently (its local wall time/offset/fold can "
+        "differ from the start's)."
+    ),
+)
+async def available_occurrences(
+    request: AvailableOccurrenceRequest,
+) -> AvailableOccurrenceResponse:
+    result = expand_available_occurrences(
+        request.model_dump(), max_occurrences=_max_occurrences()
+    )
+    return AvailableOccurrenceResponse(**result)

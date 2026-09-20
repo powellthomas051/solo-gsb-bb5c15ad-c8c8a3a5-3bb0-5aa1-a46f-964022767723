@@ -126,6 +126,51 @@ class BusinessOccurrenceRequest(OccurrenceRequest):
     )
 
 
+class BusyInterval(BaseModel):
+    """A half-open busy interval ``[start, end)`` given in UTC (or with an offset)."""
+
+    start: str = Field(
+        ...,
+        min_length=1,
+        description="Busy interval start (inclusive); must carry an offset, e.g. '2025-01-01T09:00:00Z'.",
+        examples=["2025-01-01T09:00:00Z"],
+    )
+    end: str = Field(
+        ...,
+        min_length=1,
+        description="Busy interval end (exclusive); must carry an offset and be after start.",
+        examples=["2025-01-01T10:00:00Z"],
+    )
+
+
+class AvailableOccurrenceRequest(OccurrenceRequest):
+    """Body of ``POST /available-occurrences``.
+
+    Adds the requested slot length and a list of busy half-open UTC intervals
+    to :class:`OccurrenceRequest`. The query window constrains only the
+    candidate **start** instant; the slot end is the start plus
+    ``duration_minutes`` of real elapsed time and may lie past
+    ``interval_end``.
+    """
+
+    duration_minutes: int = Field(
+        ...,
+        gt=0,
+        le=1_000_000_000,
+        description="Slot length in real elapsed minutes; the end is start + this duration in UTC.",
+        examples=[60],
+    )
+    busy_intervals: list[BusyInterval] = Field(
+        default_factory=list,
+        description=(
+            "Busy half-open intervals [start, end) with explicit UTC offsets. "
+            "Overlapping or touching intervals are merged before matching; "
+            "a candidate slot [start, end) is returned only when it has no "
+            "intersection with any (merged) busy interval."
+        ),
+    )
+
+
 class Occurrence(BaseModel):
     local: str = Field(..., description="Wall-clock time in the requested zone (ISO-8601).")
     utc: str = Field(..., description="UTC instant with trailing 'Z' (ISO-8601).")
@@ -167,6 +212,64 @@ class BusinessOccurrenceResponse(BaseModel):
     count: int
     business_day_convention: Literal["following", "preceding", "modified_following"]
     occurrences: list[BusinessOccurrence]
+
+
+class InstantView(BaseModel):
+    """One instant rendered both as local wall time and as UTC."""
+
+    local: str = Field(..., description="Wall-clock time in the requested zone (ISO-8601).")
+    utc: str = Field(..., description="UTC instant with trailing 'Z' (ISO-8601).")
+    utc_offset: str = Field(
+        ...,
+        description="UTC offset at that instant, formatted as '+HH:MM'/'-HH:MM'.",
+    )
+    dst: bool = Field(..., description="Whether daylight-saving time is in effect at that instant.")
+    fold: Literal[0, 1] = Field(
+        ...,
+        description="0 for a regular/earlier instant; 1 for the second pass of a repeated wall time.",
+    )
+
+
+class AvailableSlot(BaseModel):
+    """A candidate slot ``[start, end)`` that does not intersect any busy interval."""
+
+    start: InstantView = Field(..., description="Slot start (local + UTC); constrained by the query window.")
+    end: InstantView = Field(
+        ...,
+        description=(
+            "Slot end = start + duration_minutes of real elapsed time (local + UTC); "
+            "its local wall time, offset, DST flag and fold are resolved independently."
+        ),
+    )
+    fold: Literal[0, 1] = Field(
+        ...,
+        description=(
+            "Fold of the repeated wall time the slot starts from: 0 for a "
+            "regular/earlier instant, 1 for the second pass."
+        ),
+    )
+    source: Literal["rrule", "rdate"] = Field(
+        ...,
+        description="Whether the start instance comes from the RRULE or an RDATE entry."
+    )
+
+
+class BusyIntervalView(BaseModel):
+    """A normalized busy interval after merging (always rendered in UTC)."""
+
+    start: str = Field(..., description="Merged busy interval start (inclusive), ISO-8601 with 'Z'.")
+    end: str = Field(..., description="Merged busy interval end (exclusive), ISO-8601 with 'Z'.")
+
+
+class AvailableOccurrenceResponse(BaseModel):
+    timezone: str
+    duration_minutes: int
+    count: int
+    busy_intervals: list[BusyIntervalView] = Field(
+        ...,
+        description="The busy intervals after validating and merging overlaps/touching neighbors, in UTC."
+    )
+    slots: list[AvailableSlot]
 
 
 class HealthResponse(BaseModel):

@@ -29,6 +29,7 @@ raw wall times. EXDATE still matches the wall time *before* the adjustment.
 
 from __future__ import annotations
 
+import bisect
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -695,4 +696,143 @@ def expand_business_occurrences(
         "count": len(occurrences),
         "business_day_convention": convention,
         "occurrences": occurrences,
+    }
+
+
+# ------------------------------------------------- availability / busy slots ----
+
+# Hard cap on the number of busy intervals accepted in one request.
+MAX_BUSY_INTERVALS = 10_000
+
+
+def _parse_busy_bound(value: str, field: str) -> datetime:
+    """Parse one end of a busy interval; it must be an explicit-offset instant."""
+    dt, aware = _parse_iso(value, field, require_time=True)
+    if not aware:
+        raise invalid_datetime(field, value, "an explicit UTC offset ('Z' or '+HH:MM') is required")
+    return dt.astimezone(timezone.utc)
+
+
+def merge_busy_intervals(raw: list[Any]) -> list[tuple[datetime, datetime]]:
+    """Validate and merge busy half-open UTC intervals.
+
+    Each entry is ``{'start': ..., 'end': ...}`` with explicit-offset bounds;
+    intervals whose end is equal to or later than another interval's start
+    (i.e. overlapping or merely touching — half-open intervals that touch do
+    not share an instant but are coalesced anyway) are merged into one.
+    Returns disjoint, UTC-normalized intervals sorted by start.
+    """
+    if len(raw) > MAX_BUSY_INTERVALS:
+        raise invalid_interval(
+            f"more than {MAX_BUSY_INTERVALS} busy_intervals were supplied"
+        )
+    parsed: list[tuple[datetime, datetime]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise invalid_interval(
+                f"busy_intervals[{index}] must be an object with 'start' and 'end'"
+            )
+        start_raw = item.get("start")
+        end_raw = item.get("end")
+        if not isinstance(start_raw, str) or not isinstance(end_raw, str):
+            raise invalid_interval(
+                f"busy_intervals[{index}] requires string 'start' and 'end' with UTC offsets"
+            )
+        start = _parse_busy_bound(start_raw, f"busy_intervals[{index}].start")
+        end = _parse_busy_bound(end_raw, f"busy_intervals[{index}].end")
+        if start >= end:
+            raise invalid_interval(
+                f"busy_intervals[{index}] must have start strictly before end"
+            )
+        parsed.append((start, end))
+
+    parsed.sort()
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in parsed:
+        if merged and start <= merged[-1][1]:
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _format_utc_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def _instant_output(aware: datetime, zone: tzinfo) -> dict:
+    """Local/UTC rendering of one aware instant (fold read from the zone)."""
+    local = aware.astimezone(zone)
+    utc_dt = aware.astimezone(timezone.utc)
+    offset = local.utcoffset() or timedelta(0)
+    dst_delta = local.dst()
+    return {
+        "local": local.replace(tzinfo=None).isoformat(),
+        "utc": utc_dt.replace(tzinfo=None).isoformat() + "Z",
+        "utc_offset": _format_offset(offset),
+        "dst": bool(dst_delta and dst_delta.total_seconds() != 0),
+        "fold": local.fold,
+    }
+
+
+def expand_available_occurrences(
+    payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES
+) -> dict:
+    """Expand candidate start times and keep those free for the given duration.
+
+    The recurrence set is expanded exactly like :func:`expand_occurrences`
+    (same RRULE/RDATE/EXDATE, time-zone and ``dst_policy`` semantics); the
+    query window ``[interval_start, interval_end)`` constrains only each
+    candidate **start** instant. For every candidate whose start is inside the
+    window, the end instant is ``start + duration_minutes`` of *real elapsed*
+    time (plain UTC timedelta arithmetic, so DST transitions neither stretch
+    nor shrink the slot), and the candidate is returned only when the
+    half-open slot ``[start, end)`` does not intersect any merged busy
+    interval. Each pass of a repeated wall time is judged independently.
+    """
+    duration = timedelta(minutes=payload["duration_minutes"])
+    busy = merge_busy_intervals(payload.get("busy_intervals") or [])
+    busy_starts = [start for start, _end in busy]
+
+    expanded = expand_occurrences(payload, max_occurrences=max_occurrences)
+    zone = get_zone(payload["timezone"])
+
+    slots: list[dict] = []
+    for occurrence in expanded["occurrences"]:
+        start_utc = _parse_busy_bound(occurrence["utc"], "occurrence.utc")
+        end_utc = start_utc + duration
+
+        # Intersection test against the merged, sorted, disjoint intervals.
+        # Only the interval at insertion point and the one before it can reach
+        # the slot; touching endpoints are allowed (both sides are half-open).
+        pos = bisect.bisect_right(busy_starts, start_utc)
+        clashes = False
+        if pos < len(busy) and end_utc > busy[pos][0]:
+            clashes = True
+        if not clashes and pos > 0 and start_utc < busy[pos - 1][1]:
+            clashes = True
+        if clashes:
+            continue
+
+        start = _instant_output(start_utc, zone)
+        end = _instant_output(end_utc, zone)
+        slots.append(
+            {
+                "start": start,
+                "end": end,
+                "fold": occurrence["fold"],
+                "source": occurrence["source"],
+            }
+        )
+
+    return {
+        "timezone": payload["timezone"],
+        "duration_minutes": int(duration.total_seconds() // 60),
+        "count": len(slots),
+        "busy_intervals": [
+            {"start": _format_utc_z(start), "end": _format_utc_z(end)}
+            for start, end in busy
+        ],
+        "slots": slots,
     }
